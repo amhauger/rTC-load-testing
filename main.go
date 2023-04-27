@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -351,6 +352,38 @@ func (m *MoveRoutine) Run(client *RTCClient, writer *csv.Writer) {
 			log.Info().Msg("move routine received done signal")
 			return
 		case <-m.Ticker.C:
+			queue, records, err := client.GetQueue()
+			if err != nil {
+				log.Warn().Err(err).Msg("error getting queue from rTC, not attempting move")
+				continue
+			}
+			writer.Write(records)
+
+			indexOfFirstLoadWash := 0
+			for i, wash := range queue.Queue.QueueItems {
+				if wash.WashPkgNum == 1 {
+					indexOfFirstLoadWash = i
+					break
+				}
+			}
+
+			if indexOfFirstLoadWash == 0 {
+				log.Warn().Err(err).Msg("no washes queued by routines, not attempting move")
+			}
+
+			numWashes := len(queue.Queue.QueueItems)
+			source := rand.NewSource(time.Now().UnixNano())
+			r := rand.New(source)
+			before := r.Intn(numWashes)
+			p := MoveWashReqParams{
+				WashID:   indexOfFirstLoadWash,
+				ToBefore: before,
+			}
+			_, records, err = client.MoveWash(p)
+			if err != nil {
+				log.Warn().Err(err).Int("toBefore", before).Msg("error moving wash 1 to before wash")
+			}
+			writer.Write(records)
 		}
 	}
 }
