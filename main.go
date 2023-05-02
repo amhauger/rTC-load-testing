@@ -454,6 +454,7 @@ func (m *MoveRoutine) Run(client *RTCClient, writer *Writer) {
 				writer.Records <- records
 				continue
 			}
+			writer.Records <- records
 
 			queue, records, err := client.GetQueue()
 			if err != nil {
