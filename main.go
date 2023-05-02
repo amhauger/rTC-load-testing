@@ -20,36 +20,21 @@ import (
 // 3. every z seconds we are going to swap a vehicle from place 1 to place rand int [2:len(queue)]
 func main() {
 	// flags
-	queueCar := flag.Int("queue", 2, "number of seconds between car queueing")
-	getQueue := flag.Int("get", 4, "number of seconds between calls to get queue")
-	moveCar := flag.Int("move", 6, "number of seconds between calls to move lead car")
+	queueCar := flag.Float64("queue", 2, "number of seconds between car queueing")
+	getQueue := flag.Float64("get", 4, "number of seconds between calls to get queue")
+	moveCar := flag.Float64("move", 6, "number of seconds between calls to move lead car")
 	rtcHost := flag.String("client", "192.168.1.80", "ip of rTC")
 	rtcPort := flag.Int("port", 20250, "port for rTC")
 
 	flag.Parse()
 
 	// csv creation
-	t := time.Now().String()
-	date, err := time.Parse("DateOnly", t)
-	if err != nil {
-		log.Fatal().Err(err).Msg("error parsing current time to date only")
-		panic(err)
-	}
-	time, err := time.Parse("TimeOnly", t)
-	if err != nil {
-		log.Fatal().Err(err).Msg("error parsing current time to time only")
-		panic(err)
-	}
+	t := time.Now()
+	date := t.Format(time.DateOnly)
+	time := t.Format(time.TimeOnly)
 
-	fileName := fmt.Sprintf("%s/%s/load-test.csv", date, time)
-	_, err = os.Stat(fileName)
-	var f *os.File
-	if os.IsNotExist(err) {
-		f, err = os.Create(fileName)
-	} else {
-		fileName = fmt.Sprintf("%s+1", fileName)
-		f, err = os.Create(fileName)
-	}
+	fileName := fmt.Sprintf("load-test-%s-%s.csv", date, time)
+	f, err := os.Create(fileName)
 
 	if err != nil {
 		log.Fatal().Err(err).Str("fileName", fileName).Msg("unable to create csv file")
@@ -66,12 +51,18 @@ func main() {
 	// create and run routines
 	routines := CreateRoutines(*queueCar, *getQueue, *moveCar)
 	routines.RTC = CreateRTCClient(*rtcHost, *rtcPort)
-	routines.Writer = csvWriter
+	routines.Writer = &Writer{
+		Writer:  csvWriter,
+		Records: make(chan []string, 100),
+		Done:    make(chan bool),
+	}
 	routines.RunAll()
 
 	r := gin.New()
 	r.GET("/stop", routines.StopAll)
-	r.GET("/stop/queue-and-move", routines.StartQueueAndMove)
+	r.GET("/start", routines.StartAll)
+	r.GET("/start/get", routines.StartGet)
+	r.GET("/stop/queue-and-move", routines.StopQueueAndMove)
 	r.GET("/start/queue-and-move", routines.StartQueueAndMove)
 	r.GET("/delete", routines.DeleteQueuedCars)
 	r.GET("/update/queue/:seconds", routines.UpdateQueueTime)
@@ -83,15 +74,35 @@ func main() {
 	log.Fatal().Err(r.Run(":3001"))
 }
 
+type Writer struct {
+	Writer  *csv.Writer
+	Records chan []string
+	Done    chan bool
+}
+
+func (w *Writer) Write() {
+	for {
+		select {
+		case <-w.Done:
+			log.Info().Msg("write routine received done signal")
+			return
+		case <-w.Records:
+			record := <-w.Records
+			log.Info().Strs("record", record).Msg("writing record to csv")
+			w.Writer.Write(record)
+		}
+	}
+}
+
 type Routines struct {
 	*QueueRoutine
 	*GetRoutine
 	*MoveRoutine
 	RTC    *RTCClient
-	Writer *csv.Writer
+	Writer *Writer
 }
 
-func CreateRoutines(queueTime, getTime, moveTime int) *Routines {
+func CreateRoutines(queueTime, getTime, moveTime float64) *Routines {
 	queueDone := make(chan bool)
 	getDone := make(chan bool)
 	moveDone := make(chan bool)
@@ -107,6 +118,11 @@ func CreateRoutines(queueTime, getTime, moveTime int) *Routines {
 	}
 }
 
+func (r *Routines) StartAll(c *gin.Context) {
+	r.RunAll()
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 func (r *Routines) RunAll() {
 	go r.QueueRoutine.Run(r.RTC, r.Writer)
 	log.Info().Msg("queue routine started")
@@ -116,21 +132,31 @@ func (r *Routines) RunAll() {
 
 	go r.MoveRoutine.Run(r.RTC, r.Writer)
 	log.Info().Msg("move routine started")
+
+	go r.Writer.Write()
+	log.Info().Msg("records writer routine started")
 }
 
 func (r *Routines) StopAll(c *gin.Context) {
 	r.QueueRoutine.Done <- true
 	r.GetRoutine.Done <- true
 	r.MoveRoutine.Done <- true
+	r.Writer.Done <- true
 
-	c.Redirect(http.StatusOK, "/delete")
+	c.Redirect(http.StatusFound, "/delete")
+}
+
+func (r *Routines) StartGet(c *gin.Context) {
+	go r.GetRoutine.Run(r.RTC, r.Writer)
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 func (r *Routines) StopQueueAndMove(c *gin.Context) {
 	r.QueueRoutine.Done <- true
 	r.MoveRoutine.Done <- true
 
-	c.Redirect(http.StatusOK, "/delete")
+	c.Redirect(http.StatusFound, "/delete")
 }
 
 func (r *Routines) StartQueueAndMove(c *gin.Context) {
@@ -139,14 +165,13 @@ func (r *Routines) StartQueueAndMove(c *gin.Context) {
 
 	go r.MoveRoutine.Run(r.RTC, r.Writer)
 	log.Info().Msg("move routine started")
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 func (r *Routines) DeleteQueuedCars(c *gin.Context) {
 	queue, times, err := r.RTC.GetQueue()
-	writeErr := r.Writer.Write(times)
-	if writeErr != nil {
-		log.Warn().Err(err).Strs("record", times).Msg("error writing get queue record to CSV")
-	}
+	r.Writer.Records <- times
 
 	if err != nil {
 		log.Error().Err(err).Msg("error getting queue to delete all washes queued by routine")
@@ -157,10 +182,7 @@ func (r *Routines) DeleteQueuedCars(c *gin.Context) {
 	for _, wash := range queue.Queue.QueueItems {
 		if wash.WashPkgNum == 1 {
 			times, err := r.RTC.DeleteQueuedCar(wash.WashID)
-			writeErr := r.Writer.Write(times)
-			if writeErr != nil {
-				log.Warn().Err(err).Strs("record", times).Msg("error writing delete record to CSV")
-			}
+			r.Writer.Records <- times
 
 			if err != nil {
 				log.Error().Err(err).Interface("wash", wash).Msg("error deleting wash from queue")
@@ -175,7 +197,10 @@ func (r *Routines) UpdateQueueTime(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no time span specified"})
 		return
 	}
-	r.QueueRoutine.UpdateTime(s)
+	if err := r.QueueRoutine.UpdateTime(s); err != nil {
+		log.Warn().Err(err).Str("queryTime", s).Msg("error updating queue time, setting it to default")
+		r.QueueRoutine.Ticker = time.NewTicker(time.Duration(2 * time.Second))
+	}
 	r.QueueRoutine.Run(r.RTC, r.Writer)
 	log.Info().Str("newTickerTime", s).Msg("successfully updated queue routine's ticker time")
 }
@@ -186,7 +211,10 @@ func (r *Routines) UpdateMoveTime(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no time span specified"})
 		return
 	}
-	r.MoveRoutine.UpdateTime(s)
+	if err := r.MoveRoutine.UpdateTime(s); err != nil {
+		log.Warn().Err(err).Str("queryTime", s).Msg("error updating move time, setting it to default")
+		r.MoveRoutine.Ticker = time.NewTicker(time.Duration(2 * time.Second))
+	}
 	go r.MoveRoutine.Run(r.RTC, r.Writer)
 	log.Info().Str("newTickerTime", s).Msg("successfully updated move routine's ticker time")
 }
@@ -197,7 +225,10 @@ func (r *Routines) UpdateGetTime(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no time span specified"})
 		return
 	}
-	r.GetRoutine.UpdateTime(s)
+	if err := r.GetRoutine.UpdateTime(s); err != nil {
+		log.Warn().Err(err).Str("queryTime", s).Msg("error updating get time, setting it to default")
+		r.GetRoutine.Ticker = time.NewTicker(time.Duration(2 * time.Second))
+	}
 	go r.GetRoutine.Run(r.RTC, r.Writer)
 	log.Info().Str("newTickerTime", s).Msg("successfully updated get routine's ticker time")
 }
@@ -221,9 +252,21 @@ func (r *Routines) UpdateAllTimes(c *gin.Context) {
 		return
 	}
 
-	r.QueueRoutine.UpdateTime(q)
-	r.MoveRoutine.UpdateTime(m)
-	r.GetRoutine.UpdateTime(g)
+	if err := r.QueueRoutine.UpdateTime(q); err != nil {
+		log.Warn().Err(err).Str("queryTime", q).Msg("error updating queue time, setting it to default")
+		r.QueueRoutine.Ticker = time.NewTicker(time.Duration(2 * time.Second))
+	}
+
+	if err := r.MoveRoutine.UpdateTime(m); err != nil {
+		log.Warn().Err(err).Str("queryTime", m).Msg("error updating move time, setting it to default")
+		r.MoveRoutine.Ticker = time.NewTicker(time.Duration(2 * time.Second))
+	}
+
+	if err := r.GetRoutine.UpdateTime(g); err != nil {
+		log.Warn().Err(err).Str("queryTime", g).Msg("error updating get time, setting it to default")
+		r.GetRoutine.Ticker = time.NewTicker(time.Duration(2 * time.Second))
+	}
+
 	r.RunAll()
 }
 
@@ -232,21 +275,20 @@ type QueueRoutine struct {
 	Ticker *time.Ticker
 }
 
-func CreateQueueRoutine(tickerTime int, doneChannel chan bool) *QueueRoutine {
-	t := strconv.Itoa(tickerTime)
-
+func CreateQueueRoutine(tickerTime float64, doneChannel chan bool) *QueueRoutine {
+	t := fmt.Sprintf("%fs", tickerTime)
 	d, err := time.ParseDuration(t)
 	if err != nil {
-		log.Error().Err(err).Int("tickerTime", tickerTime).Str("convertedTime", t).Msg("error converting queue car time string to time.duration; forcing ticker duration to be default")
-		d = 2
+		log.Error().Err(err).Float64("tickerTime", tickerTime).Str("convertedTime", t).Msg("error converting queue car time string to time.duration; forcing ticker duration to be default")
+		d = 2 * time.Second
 	}
 	return &QueueRoutine{
 		Done:   doneChannel,
-		Ticker: time.NewTicker(d * time.Second),
+		Ticker: time.NewTicker(d),
 	}
 }
 
-func (q *QueueRoutine) Run(client *RTCClient, writer *csv.Writer) {
+func (q *QueueRoutine) Run(client *RTCClient, writer *Writer) {
 	for {
 		select {
 		case <-q.Done:
@@ -260,24 +302,52 @@ func (q *QueueRoutine) Run(client *RTCClient, writer *csv.Writer) {
 				WashPackage: 1,
 			}
 
-			records, err := client.QueueWash(req)
+			washID, records, err := client.QueueWash(req)
 			if err != nil {
 				log.Warn().Err(err).Msg("unable to queue wash in queue routine")
+				writer.Records <- records
+				continue
 			}
-			writer.Write(records)
+
+			records, err = client.DeleteQueuedCar(washID)
+			if err != nil {
+				log.Warn().Err(err).Msg("unable to delete queued wash in queue routine")
+			}
+			writer.Records <- records
 		}
 	}
 }
 
-func (q *QueueRoutine) UpdateTime(tickerTime string) {
+func (q *QueueRoutine) UpdateTime(tickerTime string) error {
+	log.Info().Str("newTickerTime", tickerTime).Msg("updating queue routine's ticker time")
 	q.Done <- true
 
-	d, err := time.ParseDuration(tickerTime)
+	t, err := strconv.ParseFloat(tickerTime, 32)
+	if err != nil {
+		log.Error().Err(err).Str("updatedTime", tickerTime).Msg("error parsing string to float")
+		return err
+	}
+
+	var durationString string
+	if t < 1 {
+		if t < 0.001 {
+			durationString = fmt.Sprintf("%fns", t)
+		} else if t < 0.01 {
+			durationString = fmt.Sprintf("%fus", t)
+		} else {
+			durationString = fmt.Sprintf("%fms", t)
+		}
+	} else {
+		durationString = fmt.Sprintf("%fs", t)
+	}
+	d, err := time.ParseDuration(durationString)
 	if err != nil {
 		log.Error().Err(err).Str("tickerTime", tickerTime).Msg("error converting queue car time string to time.duration; forcing ticker duration to be default")
-		d = 2
+		d = 2 * time.Second
 	}
-	q.Ticker = time.NewTicker(d * time.Second)
+	q.Ticker = time.NewTicker(d)
+
+	return nil
 }
 
 type GetRoutine struct {
@@ -285,21 +355,20 @@ type GetRoutine struct {
 	Ticker *time.Ticker
 }
 
-func CreateGetRoutine(tickerTime int, doneChannel chan bool) *GetRoutine {
-	t := strconv.Itoa(tickerTime)
-
+func CreateGetRoutine(tickerTime float64, doneChannel chan bool) *GetRoutine {
+	t := fmt.Sprintf("%fs", tickerTime)
 	d, err := time.ParseDuration(t)
 	if err != nil {
-		log.Error().Err(err).Int("tickerTime", tickerTime).Str("convertedTime", t).Msg("error converting get queue time string to time.duration; forcing ticker duration to be default")
-		d = 4
+		log.Error().Err(err).Float64("tickerTime", tickerTime).Str("convertedTime", t).Msg("error converting get queue time string to time.duration; forcing ticker duration to be default")
+		d = 4 * time.Second
 	}
 	return &GetRoutine{
 		Done:   doneChannel,
-		Ticker: time.NewTicker(d * time.Second),
+		Ticker: time.NewTicker(d),
 	}
 }
 
-func (g *GetRoutine) Run(client *RTCClient, writer *csv.Writer) {
+func (g *GetRoutine) Run(client *RTCClient, writer *Writer) {
 	for {
 		select {
 		case <-g.Done:
@@ -310,20 +379,41 @@ func (g *GetRoutine) Run(client *RTCClient, writer *csv.Writer) {
 			if err != nil {
 				log.Warn().Err(err).Msg("unable to get rtc queue in get queue routine")
 			}
-			writer.Write(records)
+			writer.Records <- records
 		}
 	}
 }
 
-func (g *GetRoutine) UpdateTime(tickerTime string) {
+func (g *GetRoutine) UpdateTime(tickerTime string) error {
+	log.Info().Str("newTickerTime", tickerTime).Msg("updating get routine's ticker time")
 	g.Done <- true
 
-	d, err := time.ParseDuration(tickerTime)
+	t, err := strconv.ParseFloat(tickerTime, 32)
 	if err != nil {
-		log.Error().Err(err).Str("tickerTime", tickerTime).Msg("error converting get queue time string to time.duration; forcing ticker duration to be default")
-		d = 4
+		log.Error().Err(err).Str("updatedTime", tickerTime).Msg("error parsing string to float")
+		return err
 	}
-	g.Ticker = time.NewTicker(d * time.Second)
+
+	var durationString string
+	if t < 1 {
+		if t < 0.001 {
+			durationString = fmt.Sprintf("%fns", t)
+		} else if t < 0.01 {
+			durationString = fmt.Sprintf("%fus", t)
+		} else {
+			durationString = fmt.Sprintf("%fms", t)
+		}
+	} else {
+		durationString = fmt.Sprintf("%fs", t)
+	}
+	d, err := time.ParseDuration(durationString)
+	if err != nil {
+		log.Error().Err(err).Str("tickerTime", tickerTime).Msg("error converting queue car time string to time.duration; forcing ticker duration to be default")
+		d = 2 * time.Second
+	}
+	g.Ticker = time.NewTicker(d)
+
+	return nil
 }
 
 type MoveRoutine struct {
@@ -331,70 +421,102 @@ type MoveRoutine struct {
 	Ticker *time.Ticker
 }
 
-func CreateMoveRoutine(tickerTime int, doneChannel chan bool) *MoveRoutine {
-	t := strconv.Itoa(tickerTime)
-
+func CreateMoveRoutine(tickerTime float64, doneChannel chan bool) *MoveRoutine {
+	t := fmt.Sprintf("%fs", tickerTime)
 	d, err := time.ParseDuration(t)
 	if err != nil {
-		log.Error().Err(err).Int("tickerTime", tickerTime).Str("convertedTime", t).Msg("error converting move car time string to time.duration; forcing ticker duration to be default")
-		d = 6
+		log.Error().Err(err).Float64("tickerTime", tickerTime).Str("convertedTime", t).Msg("error converting move car time string to time.duration; forcing ticker duration to be default")
+		d = 6 * time.Second
 	}
 	return &MoveRoutine{
 		Done:   doneChannel,
-		Ticker: time.NewTicker(d * time.Second),
+		Ticker: time.NewTicker(d),
 	}
 }
 
-func (m *MoveRoutine) Run(client *RTCClient, writer *csv.Writer) {
+func (m *MoveRoutine) Run(client *RTCClient, writer *Writer) {
 	for {
 		select {
 		case <-m.Done:
 			log.Info().Msg("move routine received done signal")
 			return
 		case <-m.Ticker.C:
+			req := WashRequest{
+				LaneID:      "4",
+				OrderID:     "LOAD-TESTING",
+				VehicleID:   "NO-VALID-ID",
+				WashPackage: 1,
+			}
+
+			washID, records, err := client.QueueWash(req)
+			if err != nil {
+				log.Warn().Err(err).Msg("unable to queue new wash to rTC, not attempting move")
+				writer.Records <- records
+				continue
+			}
+
 			queue, records, err := client.GetQueue()
 			if err != nil {
 				log.Warn().Err(err).Msg("error getting queue from rTC, not attempting move")
+				writer.Records <- records
+				continue
+			} else if queue == nil {
+				log.Warn().Err(err).Msg("no queue received from rTC, continuing")
 				continue
 			}
-			writer.Write(records)
-
-			indexOfFirstLoadWash := 0
-			for i, wash := range queue.Queue.QueueItems {
-				if wash.WashPkgNum == 1 {
-					indexOfFirstLoadWash = i
-					break
-				}
-			}
-
-			if indexOfFirstLoadWash == 0 {
-				log.Warn().Err(err).Msg("no washes queued by routines, not attempting move")
-			}
+			writer.Records <- records
 
 			numWashes := len(queue.Queue.QueueItems)
 			source := rand.NewSource(time.Now().UnixNano())
 			r := rand.New(source)
 			before := r.Intn(numWashes)
 			p := MoveWashReqParams{
-				WashID:   indexOfFirstLoadWash,
+				WashID:   washID,
 				ToBefore: before,
 			}
 			_, records, err = client.MoveWash(p)
 			if err != nil {
 				log.Warn().Err(err).Int("toBefore", before).Msg("error moving wash 1 to before wash")
 			}
-			writer.Write(records)
+			writer.Records <- records
+
+			records, err = client.DeleteQueuedCar(washID)
+			if err != nil {
+				log.Warn().Err(err).Int("washID", washID).Msg("error deleting queued car from rTC")
+			}
+			writer.Records <- records
 		}
 	}
 }
 
-func (m *MoveRoutine) UpdateTime(tickerTime string) {
+func (m *MoveRoutine) UpdateTime(tickerTime string) error {
+	log.Info().Str("newTickerTime", tickerTime).Msg("updating move routine's ticker time")
 	m.Done <- true
 
-	d, err := time.ParseDuration(tickerTime)
+	t, err := strconv.ParseFloat(tickerTime, 32)
 	if err != nil {
-		log.Error().Err(err).Str("tickerTime", tickerTime).Msg("error converting move car time string to time.duration; forcing ticker duration to be default")
-		d = 6
+		log.Error().Err(err).Str("updatedTime", tickerTime).Msg("error parsing string to float")
+		return err
 	}
-	m.Ticker = time.NewTicker(d * time.Second)
+
+	var durationString string
+	if t < 1 {
+		if t < 0.001 {
+			durationString = fmt.Sprintf("%fns", t)
+		} else if t < 0.01 {
+			durationString = fmt.Sprintf("%fus", t)
+		} else {
+			durationString = fmt.Sprintf("%fms", t)
+		}
+	} else {
+		durationString = fmt.Sprintf("%fs", t)
+	}
+	d, err := time.ParseDuration(durationString)
+	if err != nil {
+		log.Error().Err(err).Str("tickerTime", tickerTime).Msg("error converting queue car time string to time.duration; forcing ticker duration to be default")
+		d = 2 * time.Second
+	}
+	m.Ticker = time.NewTicker(d)
+
+	return nil
 }

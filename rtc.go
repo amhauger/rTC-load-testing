@@ -56,21 +56,21 @@ func (r *RTCClient) ParseRTCAddQueueResponse(message string) (*AddQueueResponse,
 	return &wash, nil
 }
 
-func (r *RTCClient) QueueWash(washRequest WashRequest) ([]string, error) {
+func (r *RTCClient) QueueWash(washRequest WashRequest) (int, []string, error) {
 	record := []string{"QUEUE"}
 	queueXML, xmlErr := r.BuildAddTailXML(1)
 	if xmlErr != nil {
 		log.Error().Err(xmlErr).Msg("error building xml to queue wash")
 		record = append(record, time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), "true", xmlErr.Error())
-		return record, xmlErr
+		return -1, record, xmlErr
 	}
-
-	log.Info().Str("method", "QueueWash").Str("xml", queueXML).Msg("successfully created queue XML")
+	log.Info().Str("method", "queue").Msg("successfully created queue XML")
 
 	client, connectErr := r.StartConn()
 	if connectErr != nil {
-		record = append(record, time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), "true", connectErr.Error())
-		return record, connectErr
+		log.Error().Err(connectErr).Msg("error connecting to rTC")
+		record = append(record, time.Now().String(), time.Time{}.String(), time.Time{}.String(), time.Now().String(), "true", connectErr.Error())
+		return -1, record, connectErr
 	}
 	defer client.Close()
 	// connect time
@@ -79,14 +79,25 @@ func (r *RTCClient) QueueWash(washRequest WashRequest) ([]string, error) {
 	r.WriteToRTC(client, queueXML)
 	// init request time
 	record = append(record, time.Now().String())
+	log.Info().Str("method", "queue").Msg("queue message written to rTC")
 
-	_, readErr := r.ReadFromServer(client)
+	message, readErr := r.ReadFromServer(client)
 	if readErr != nil {
-		record = append(record, time.Time{}.String(), time.Time{}.String(), "true", readErr.Error())
-		return record, readErr
+		log.Error().Err(readErr).Msg("error reading queue response from rTC")
+		record = append(record, time.Time{}.String(), time.Now().String(), "true", readErr.Error())
+		return -1, record, readErr
+	} else if message == nil {
+		err := closeConnection(client)
+		if err != nil {
+			log.Error().Err(err).Str("method", "get").Msg("error closing connection during nil string check")
+			record = append(record, time.Now().String(), time.Now().String(), "true", err.Error())
+		}
+		record = append(record, time.Now().String(), time.Now().String(), "false", "")
+		return -1, record, nil
 	}
 	// retrieve request time
 	record = append(record, time.Now().String())
+	log.Info().Str("method", "queue").Msg("queue confirmation retrieved from rTC")
 
 	closeErr := client.Close()
 	if closeErr != nil {
@@ -99,14 +110,22 @@ func (r *RTCClient) QueueWash(washRequest WashRequest) ([]string, error) {
 
 		closeErr = client.Close()
 		if closeErr != nil {
-			record = append(record, time.Time{}.String(), "true", closeErr.Error())
+			record = append(record, time.Now().String(), "true", closeErr.Error())
 			log.Error().Err(closeErr).Msg("error forcefully closing connection to rTC")
-			return record, closeErr
+			return -1, record, closeErr
 		}
 	}
-
 	record = append(record, time.Now().String(), "false", "")
-	return record, nil
+	log.Info().Str("method", "queue").Msg("closed connection to rTC")
+
+	addResponse, err := r.ParseRTCAddQueueResponse(*message)
+	if err != nil {
+		log.Error().Err(err).Str("method", "queue").Str("message", *message).Msg("error parsing response from rTC into an AddQueueResponse")
+		return -1, record, nil
+	}
+	log.Info().Str("mothod", "queue").Interface("queueResponse", addResponse).Msg("successfully queued wash to rTC")
+
+	return addResponse.WashID, record, nil
 }
 
 // MoveWashReqParams is used for taking the params in JSON form, without requiring
@@ -139,15 +158,15 @@ func (r *RTCClient) MoveWash(moveRequest MoveWashReqParams) (*GetQueueResponse, 
 	moveXML, xmlErr := r.BuildMoveXML(moveRequest.WashID, moveRequest.ToBefore)
 	if xmlErr != nil {
 		log.Error().Err(xmlErr).Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Msg("error creating XML to move wash in rTC")
-		record = append(record, time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), "true", xmlErr.Error())
+		record = append(record, time.Now().String(), time.Time{}.String(), time.Time{}.String(), time.Now().String(), "true", xmlErr.Error())
 		return nil, record, xmlErr
 	}
-
-	log.Info().Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Msg("successfully created move XmL")
+	log.Info().Str("method", "move").Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Interface("moveRequest", moveXML).Msg("successfully created move XmL")
 
 	client, connectErr := r.StartConn()
 	if connectErr != nil {
-		record = append(record, time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), "true", connectErr.Error())
+		log.Error().Err(connectErr).Str("method", "move").Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Msg("error connecting to rTC")
+		record = append(record, time.Now().String(), time.Time{}.String(), time.Time{}.String(), time.Now().String(), "true", connectErr.Error())
 		return nil, record, connectErr
 	}
 	defer client.Close()
@@ -157,36 +176,50 @@ func (r *RTCClient) MoveWash(moveRequest MoveWashReqParams) (*GetQueueResponse, 
 	r.WriteToRTC(client, moveXML)
 	// init request time
 	record = append(record, time.Now().String())
+	log.Info().Str("method", "move").Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Msg("move confirmation retrieved from rTC")
 
 	readMessage, readErr := r.ReadFromServer(client)
 	if readErr != nil {
 		log.Error().Err(readErr).Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Msg("error reading move request from rTC")
-		record = append(record, time.Time{}.String(), time.Time{}.String(), "true", readErr.Error())
+		record = append(record, time.Time{}.String(), time.Now().String(), "true", readErr.Error())
 		return nil, record, readErr
+	} else if readMessage == nil {
+		err := closeConnection(client)
+		if err != nil {
+			log.Error().Err(err).Str("method", "move").Msg("error closing connection during nil string check")
+			record = append(record, time.Now().String(), time.Now().String(), "true", err.Error())
+		}
+		record = append(record, time.Now().String(), time.Now().String(), "false", "")
+		return nil, record, nil
 	}
+
 	// retrieve request time
 	record = append(record, time.Now().String())
+	log.Info().Str("method", "move").Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Str("moveResponse", *readMessage).Msg("move confirmation retrieved from rTC")
 
 	closeErr := client.Close()
 	if closeErr != nil {
 		log.Error().Err(closeErr).Msg("error closing connection to rTC when moving wash")
 		err := client.SetDeadline(time.Now())
 		if err != nil {
-			log.Info().Err(err).Msg("error setting deadline when force closing rtc connection")
+			log.Info().Err(err).Str("method", "move").Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Msg("error setting deadline when force closing rtc connection")
 		}
 		time.Sleep(5 * time.Second)
 
 		closeErr = client.Close()
 		if closeErr != nil {
-			record = append(record, time.Time{}.String(), "true", closeErr.Error())
-			log.Error().Err(closeErr).Msg("error forcefully closing connection to rTC")
+			record = append(record, time.Now().String(), "true", closeErr.Error())
+			log.Error().Err(closeErr).Str("method", "move").Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Msg("error forcefully closing connection to rTC")
 			return nil, record, closeErr
 		}
 	}
 	// close time
 	record = append(record, time.Now().String(), "false", "")
+	log.Info().Str("method", "move").Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Msg("closed connection to rTC")
 
 	resp, err := r.ParseRTCGetQueueResponse(*readMessage)
+	log.Info().Str("method", "move").Int("washID", moveRequest.WashID).Int("moveToBefore", moveRequest.ToBefore).Interface("moveResponse", resp).Msg("successfully moved wash")
+
 	return resp, record, err
 }
 
@@ -213,15 +246,14 @@ func (r *RTCClient) DeleteQueuedCar(washID int) ([]string, error) {
 	deleteXML, xmlErr := r.BuildDeleteXML(washID)
 	if xmlErr != nil {
 		log.Error().Err(xmlErr).Int("washID", washID).Msg("error creating XML to delete wash from rTC")
-		record = append(record, time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), "true", xmlErr.Error())
+		record = append(record, time.Now().String(), time.Time{}.String(), time.Time{}.String(), time.Now().String(), "true", xmlErr.Error())
 		return record, xmlErr
 	}
-
-	log.Info().Str("method", "DeleteWash").Str("xml", deleteXML).Msg("successfully created XML")
+	log.Info().Str("method", "delete").Int("washID", washID).Str("deleteRequest", deleteXML).Msg("successfully created delete XmL")
 
 	client, connectErr := r.StartConn()
 	if connectErr != nil {
-		record = append(record, time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), "true", xmlErr.Error())
+		record = append(record, time.Now().String(), time.Time{}.String(), time.Time{}.String(), time.Now().String(), "true", connectErr.Error())
 		return record, connectErr
 	}
 	defer client.Close()
@@ -231,6 +263,7 @@ func (r *RTCClient) DeleteQueuedCar(washID int) ([]string, error) {
 	r.WriteToRTC(client, deleteXML)
 	// init request time
 	record = append(record, time.Now().String(), time.Now().String())
+	log.Info().Str("method", "delete").Int("washID", washID).Msg("delete request written to rTC")
 
 	closeErr := client.Close()
 	if closeErr != nil {
@@ -243,12 +276,13 @@ func (r *RTCClient) DeleteQueuedCar(washID int) ([]string, error) {
 
 		closeErr = client.Close()
 		if closeErr != nil {
-			record = append(record, time.Time{}.String(), "true", closeErr.Error())
+			record = append(record, time.Now().String(), "true", closeErr.Error())
 			log.Error().Err(closeErr).Msg("error forcefully closing connection to rTC")
 			return record, closeErr
 		}
 	}
 	record = append(record, time.Now().String(), "false", "")
+	log.Info().Str("method", "delete").Int("washID", washID).Msg("successfully deleted wash")
 
 	return record, nil
 }
@@ -285,22 +319,34 @@ func (r *RTCClient) GetQueue() (*GetQueueResponse, []string, error) {
 	record := []string{"GET"}
 	client, connectErr := r.StartConn()
 	if connectErr != nil {
-		record = append(record, time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), time.Time{}.String(), "true", connectErr.Error())
+		record = append(record, time.Now().String(), time.Time{}.String(), time.Time{}.String(), time.Now().String(), "true", connectErr.Error())
 		return nil, record, connectErr
 	}
 	defer client.Close()
+
 	// connection time
 	record = append(record, time.Now().String())
 
 	r.WriteToRTC(client, getQueueXML)
 	// initialize request time
 	record = append(record, time.Now().String())
+	log.Info().Str("method", "get").Str("getQueueXML", getQueueXML).Msg("wrote request to get queue to rTC")
 
 	readMessage, readErr := r.ReadFromServer(client)
 	if readErr != nil {
 		record = append(record, time.Time{}.String(), time.Time{}.String(), "true", readErr.Error())
 		return nil, record, readErr
+	} else if readMessage == nil {
+		err := closeConnection(client)
+		if err != nil {
+			log.Error().Err(err).Str("method", "get").Msg("error closing connection during nil string check")
+			record = append(record, time.Now().String(), time.Now().String(), "true", err.Error())
+		}
+		record = append(record, time.Now().String(), time.Now().String(), "false", "")
+		return nil, record, nil
 	}
+	log.Info().Str("method", "get").Str("queueResponse", *readMessage).Msg("successfully retrieved queue from rTC")
+
 	// retrieval time
 	record = append(record, time.Now().String())
 
@@ -308,20 +354,22 @@ func (r *RTCClient) GetQueue() (*GetQueueResponse, []string, error) {
 	if closeErr != nil {
 		err := client.SetDeadline(time.Now())
 		if err != nil {
-			log.Info().Err(err).Msg("error setting deadline when force closing connection")
+			log.Info().Err(err).Str("method", "get").Msg("error setting deadline when force closing connection")
 		}
 		time.Sleep(5 * time.Second)
 
 		closeErr = client.Close()
 		if closeErr != nil {
 			record = append(record, time.Time{}.String(), "true", closeErr.Error())
-			log.Err(closeErr).Msg("error forcefully closing connection")
+			log.Err(closeErr).Str("method", "get").Msg("error forcefully closing connection")
 			return nil, record, closeErr
 		}
 	}
 	// close time
 	record = append(record, time.Now().String(), "false", "")
 	message, err := r.ParseRTCGetQueueResponse(*readMessage)
+
+	log.Info().Str("method", "GET").Interface("queue", message.Queue).Msg("successfully retrieved queue")
 	return message, record, err
 }
 
@@ -342,7 +390,7 @@ func (r *RTCClient) StartConn() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Debug().Str("host", r.Host).Int("port", r.Port).Msg("connection opened on port")
+	log.Info().Str("host", r.Host).Int("port", r.Port).Msg("connection opened on port")
 
 	err = client.SetDeadline(time.Now().Add(1500 * time.Millisecond))
 	if err != nil {
@@ -369,4 +417,22 @@ func (r *RTCClient) ReadFromServer(client net.Conn) (*string, error) {
 
 	rtcMessage = strings.TrimSpace(rtcMessage)
 	return &rtcMessage, nil
+}
+
+func closeConnection(client net.Conn) error {
+	closeErr := client.Close()
+	if closeErr != nil {
+		err := client.SetDeadline(time.Now())
+		if err != nil {
+			log.Info().Err(err).Msg("error setting deadline when force closing connection")
+		}
+		time.Sleep(5 * time.Second)
+
+		closeErr = client.Close()
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+
+	return nil
 }

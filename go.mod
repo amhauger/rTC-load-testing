@@ -1,4 +1,4 @@
-module not-busy-load-testing
+module rtc-load-testing
 
 go 1.20
 
